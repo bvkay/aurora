@@ -215,9 +215,10 @@ class MEstimator(RegressionEstimator):
         TODO: Consider not setting iter_control.number_of_iterations
          - Instead, Initialize a new iter_control object
         """
+        # iter_control is shared by the bands of a decimation level, so the
+        # count must be reset before it is checked.
+        self.iter_control.reset_number_of_iterations()
         converged = self.iter_control.max_iterations_reached
-        if self.iter_control.number_of_iterations:
-            self.iter_control.reset_number_of_iterations()
         while not converged:
             b0 = self.b
             self.iter_control.increment_iteration_number()
