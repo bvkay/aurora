@@ -25,6 +25,7 @@ from loguru import logger
 from typing import Literal, Optional, Union
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 ESTIMATOR_LIBRARY = {"OLS": RegressionEstimator, "RME": RME, "RME_RR": RME_RR}
@@ -213,6 +214,139 @@ def apply_weights(
     return X, Y, RR
 
 
+def _utc_naive(value) -> np.datetime64:
+    """A time (ISO string, Timestamp, datetime64; naive is taken as UTC) as naive UTC datetime64[ns]."""
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("UTC").tz_localize(None)
+    return np.datetime64(ts.to_datetime64(), "ns")
+
+
+def window_mask_for_band(
+    dec_level_config: AuroraDecimationLevel,
+    band,
+    times: np.ndarray,
+) -> Optional[np.ndarray]:
+    """
+    Returns a boolean array over the STFT windows, True for the windows to keep in this band.
+
+    dec_level_config.window_masks (optional; None or [] means no masking) is a list of
+    [start, end, pmin_s, pmax_s]: a time interval (UTC; ISO strings or timestamps, naive
+    is UTC) and a period range in seconds. A mask applies to a band whose center period
+    lies in [pmin_s, pmax_s], and removes from that band every STFT window that overlaps
+    [start, end): window k spans [times[k], times[k] + num_samples / sample_rate), times
+    being the STFT's time axis (the first sample of each window). The windows are removed
+    before the regression, so no weighting ever sees them. A band the masks would leave
+    with fewer than max(1, stft.min_num_stft_windows) windows is left unmasked, with a
+    warning.
+
+    Parameters
+    ----------
+    dec_level_config: AuroraDecimationLevel
+        Processing parameters for the active decimation level.
+    band: mt_metadata.common.band.Band
+        The frequency band being estimated.
+    times: np.ndarray
+        The time axis of the band's STFT (datetime64).
+
+    Returns
+    -------
+    keep: np.ndarray of bool, or None
+        None when no mask removes a window from this band.
+    """
+    masks = getattr(dec_level_config, "window_masks", None)
+    if not masks:
+        return None
+    period = band.center_period
+    t = np.asarray(times).astype("datetime64[ns]")
+    window_ns = int(
+        round(
+            1e9
+            * dec_level_config.stft.window.num_samples
+            / dec_level_config.decimation.sample_rate
+        )
+    )
+    window = np.timedelta64(window_ns, "ns")
+    drop = np.zeros(t.size, dtype=bool)
+    for start, end, pmin_s, pmax_s in masks:
+        if not min(pmin_s, pmax_s) <= period <= max(pmin_s, pmax_s):
+            continue
+        drop |= (t < _utc_naive(end)) & (t + window > _utc_naive(start))
+    if not drop.any():
+        return None
+    minimum = max(1, int(dec_level_config.stft.min_num_stft_windows or 0))
+    if t.size - int(drop.sum()) < minimum:
+        msg = (
+            f"window masks would leave band {period:.6f}s {t.size - int(drop.sum())} of "
+            f"{t.size} STFT windows (minimum {minimum}): band left unmasked"
+        )
+        logger.warning(msg)
+        return None
+    logger.info(
+        f"window masks: band {period:.6f}s drops {int(drop.sum())} of {t.size} STFT windows"
+    )
+    return ~drop
+
+
+def apply_window_mask(
+    X: xr.Dataset,
+    Y: xr.Dataset,
+    RR: Optional[xr.Dataset],
+    keep: Optional[np.ndarray],
+) -> tuple:
+    """Drops the STFT windows `keep` marks False from X, Y and RR (all three, same time axis)."""
+    if keep is None:
+        return X, Y, RR
+    X = X.isel(time=keep)
+    Y = Y.isel(time=keep)
+    if RR is not None:
+        RR = RR.isel(time=keep)
+    return X, Y, RR
+
+
+def get_band_weights(chws, band, all_frequencies, band_frequencies) -> np.ndarray:
+    """
+    One weight per STFT window for `band`, from a channel weight spec's weights.
+
+    Weights with a frequency dimension (xarray) are taken through
+    chws.get_weights_for_band(band), the bin nearest the band's center frequency.
+    A 2D numpy array is (time, frequency) on the STFT's frequency axis (the layout the
+    previous ``weights.mean(axis=1)`` assumed): it is averaged over the band's own
+    harmonics only. A 1D array is already one weight per window.
+    (mt_metadata's get_weights_for_band takes axis 0 of a numpy array as frequency, which
+    is the time axis here, so a plain array does not go through it.)
+
+    Parameters
+    ----------
+    chws: ChannelWeightSpec
+        The spec whose .weights were set by calculate_weights.
+    band: mt_metadata.common.band.Band
+    all_frequencies: np.ndarray
+        The frequency axis of the level's STFT.
+    band_frequencies: np.ndarray
+        The harmonics the band was extracted with (X.frequency).
+
+    Returns
+    -------
+    band_weights: np.ndarray
+        Shape (n_windows,).
+    """
+    weights = chws.weights
+    if hasattr(weights, "dims") and any("freq" in str(d) for d in weights.dims):
+        return np.asarray(chws.get_weights_for_band(band)).squeeze()
+    weights = np.asarray(weights)
+    if weights.ndim == 1:
+        return weights
+    in_band = np.isin(np.asarray(all_frequencies), np.asarray(band_frequencies))
+    if weights.ndim == 2 and weights.shape[1] == in_band.size and in_band.any():
+        return weights[:, in_band].mean(axis=1)
+    msg = (
+        f"cannot take band weights for band {band.center_period:.6f}s from weights of "
+        f"shape {weights.shape} (STFT has {in_band.size} frequencies)"
+    )
+    raise ValueError(msg)
+
+
 def process_transfer_functions(
     dec_level_config: AuroraDecimationLevel,
     local_stft_obj: xr.Dataset,
@@ -249,6 +383,8 @@ def process_transfer_functions(
         X, Y, RR = get_band_for_tf_estimate(
             band, dec_level_config, local_stft_obj, remote_stft_obj
         )
+        keep = window_mask_for_band(dec_level_config, band, X.time.values)
+        X, Y, RR = apply_window_mask(X, Y, RR, keep)
 
         # Reshape to 2d
         X, Y, RR = stack_fcs(X, Y, RR)
@@ -330,26 +466,31 @@ def process_transfer_functions_with_weights(
 
         # check if there are channel weights for this channel
         weights = None
+        channel_spec = None
         for chws in dec_level_config.channel_weight_specs:
             if ch in chws.output_channels:
                 weights = chws.weights
+                channel_spec = chws  # not the loop variable: that ends on the last spec
 
         for band in transfer_function_obj.frequency_bands.bands():
 
             X, Y, RR = get_band_for_tf_estimate(
                 band, dec_level_config, local_stft_obj, remote_stft_obj
             )
+            keep = window_mask_for_band(dec_level_config, band, X.time.values)
+            X, Y, RR = apply_window_mask(X, Y, RR, keep)
             Y_ch = Y[ch].to_dataset()  # keep as a dataset, maybe not needed
 
             # extract the weights for this band
             if weights is not None:
-                # TODO: Investigate best way to extract the weights for band
-                #  This may involve finding the nearest frequency bin to the band center period
-                #  and then applying the weights for that bin, or some tapered region around it.
-                #  For now, we will just use the mean of the weights for the band.
-                #  This is a temporary solution and should be replaced with a more robust method.
-                # band_weights = chws.get_weights_for_band(band)
-                band_weights = weights.mean(axis=1)  # chws.get_weights_for_band(band)
+                band_weights = get_band_weights(
+                    channel_spec,
+                    band,
+                    local_stft_obj.frequency.values,
+                    X.frequency.values,
+                )
+                if keep is not None:
+                    band_weights = band_weights[keep]  # the windows the masks kept
 
                 apply_weights(
                     X, Y_ch, RR, band_weights.squeeze(), segment=True, dropna=False
