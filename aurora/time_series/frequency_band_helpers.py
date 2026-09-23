@@ -4,11 +4,36 @@
 """
 from typing import Optional, Tuple
 
+import numpy as np
 import xarray as xr
 from loguru import logger
 from mt_metadata.processing.aurora import Band
 from mt_metadata.processing.aurora import DecimationLevel as AuroraDecimationLevel
-from mt_timeseries.spectre.spectrogram import extract_band
+from mt_timeseries.spectre.spectrogram import extract_band  # noqa: F401 (was used here)
+
+
+def band_harmonic_indices(
+    band: Band, frequencies: np.ndarray, epsilon: float = 1e-7
+) -> np.ndarray:
+    """
+    Indices of the harmonics in [band.lower_bound - epsilon, band.upper_bound + epsilon].
+
+    The same selection as mt_timeseries.spectre.spectrogram.extract_band, which does it
+    with xarray's where(drop=True).
+    """
+    frequencies = np.asarray(frequencies)
+    in_band = (frequencies >= band.lower_bound - epsilon) & (
+        frequencies <= band.upper_bound + epsilon
+    )
+    indices = np.flatnonzero(in_band)
+    if indices.size == 0:
+        msg = (
+            f"Frequency band {band} does not overlap with the frequencies "
+            f"of the input dataset.  Frequencies in dataset are: {frequencies}. "
+            "Skipping band extraction. Consider reforming the bands."
+        )
+        logger.warning(msg)
+    return indices
 
 
 def get_band_for_tf_estimate(
@@ -45,13 +70,17 @@ def get_band_for_tf_estimate(
     logger.info(
         f"Accessing band {band.center_period:.6f}s  ({1./band.center_period:.6f}Hz)"
     )
-    band_dataset = extract_band(band, local_stft_obj)
-    X = band_dataset[dec_level_config.input_channels]
-    Y = band_dataset[dec_level_config.output_channels]
+    # isel on the harmonic indices: the same values as extract_band's
+    # where(drop=True), without its masked copy of every channel
+    indices = band_harmonic_indices(band, local_stft_obj.frequency.values)
+    X = local_stft_obj[dec_level_config.input_channels].isel(frequency=indices)
+    Y = local_stft_obj[dec_level_config.output_channels].isel(frequency=indices)
     check_time_axes_synched(X, Y)
     if dec_level_config.reference_channels:
-        band_dataset = extract_band(band, remote_stft_obj)
-        RR = band_dataset[dec_level_config.reference_channels]
+        indices = band_harmonic_indices(band, remote_stft_obj.frequency.values)
+        RR = remote_stft_obj[dec_level_config.reference_channels].isel(
+            frequency=indices
+        )
         check_time_axes_synched(Y, RR)
     else:
         RR = None
