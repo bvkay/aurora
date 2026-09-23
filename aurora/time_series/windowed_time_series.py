@@ -15,6 +15,7 @@ from mt_metadata.processing.window import get_fft_harmonics
 
 from typing import Optional, Union
 from loguru import logger
+import functools
 import numpy as np
 import scipy.signal as ssig
 import xarray as xr
@@ -98,9 +99,7 @@ class WindowedTimeSeries(object):
                 # TODO: use nan_to_mean from time_series helpers
 
             try:
-                ensembles = ssig.detrend(
-                    ensembles, axis=detrend_axis, type=detrend_type
-                )
+                ensembles = _detrend(ensembles, axis=detrend_axis, type=detrend_type)
             except ValueError as e:
                 # TODO: Add doc -- this looks like it may be handling invalid detrend types
                 msg = (
@@ -149,6 +148,40 @@ class WindowedTimeSeries(object):
         spectral_ds *= spectral_density_correction
 
         return spectral_ds
+
+
+@functools.lru_cache(maxsize=16)
+def _linear_trend_operators(num_samples: int) -> tuple:
+    """
+    (A, pinv(A)) for a least-squares line over num_samples points, with A built as
+    scipy.signal.detrend builds it: columns (1..num_samples) / num_samples and ones.
+    """
+    A = np.ones((num_samples, 2))
+    A[:, 0] = np.arange(1, num_samples + 1) / num_samples
+    return A, np.linalg.pinv(A)
+
+
+def _detrend(data: np.ndarray, axis: int, type: str) -> np.ndarray:
+    """
+    scipy.signal.detrend(data, axis=axis, type=type), with the linear case computed in
+    closed form for finite float64 data: the least-squares line of every window is
+    pinv(A) applied along the axis, so no lstsq is solved per call. The result agrees
+    with scipy's to rounding error. Other types, dtypes and non-finite data go to
+    scipy (which raises on non-finite data, as before).
+    """
+    if (
+        type != "linear"
+        or data.dtype != np.float64
+        or data.ndim == 0
+        or data.shape[axis] < 3
+        or not np.isfinite(data).all()
+    ):
+        return ssig.detrend(data, axis=axis, type=type)
+    x = np.moveaxis(data, axis, -1)
+    A, A_pinv = _linear_trend_operators(x.shape[-1])
+    detrended = (x @ A_pinv.T) @ A.T  # the trend
+    np.subtract(x, detrended, out=detrended)
+    return np.moveaxis(detrended, -1, axis)
 
 
 def _get_time_coordinate_axis(dataset: xr.Dataset) -> int:
