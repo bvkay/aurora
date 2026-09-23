@@ -72,7 +72,12 @@ class EffectiveDegreesOfFreedom(object):
         """
         return self.c2 * (self.n_data**self.alpha)
 
-    def compute_weights(self, X: np.ndarray, use: np.ndarray) -> np.ndarray:
+    def compute_weights(
+        self,
+        X: np.ndarray,
+        use: np.ndarray,
+        products: Optional[tuple] = None,
+    ) -> np.ndarray:
         """
         Compute the EDF Weights
 
@@ -145,6 +150,10 @@ class EffectiveDegreesOfFreedom(object):
             The data to for which to determine weights.
         use : np.ndarray
             populated with booleans
+        products : tuple or None
+            (X[0] * conj(X[0]), X[1] * conj(X[1]), conj(X[1]) * X[0]), as returned by
+            edf_products(X). Computed here when None. Pass them when calling repeatedly
+            with the same X.
 
         Returns
         -------
@@ -152,8 +161,9 @@ class EffectiveDegreesOfFreedom(object):
             The weights values.
 
         """
-        S = X[:, use] @ np.conj(X[:, use]).T  # covariance matrix, 2x2
-        S /= sum(use)  # normalize by the number of datapoints
+        X_use = X[:, use]
+        S = X_use @ np.conj(X_use).T  # covariance matrix, 2x2
+        S /= np.count_nonzero(use)  # normalize by the number of datapoints
 
         # if H is singular then set to zeros otherwise an error is raised
         # and kills the processing.  If we catch it and set to zeros then
@@ -184,9 +194,11 @@ class EffectiveDegreesOfFreedom(object):
         # - The covariance matrix is computed from the inliers (`use`).
         # - The leverage (EDF) is computed for all points, using the inlier covariance.
         # - This lets the algorithm decide which points to drop next, based on their leverage under the current model.
-        xx_term = np.real(X[0, :] * np.conj(X[0, :]) * H[0, 0])
-        yy_term = np.real(X[1, :] * np.conj(X[1, :]) * H[1, 1])
-        xy_term = 2 * np.real(np.conj(X[1, :]) * X[0, :] * H[1, 0])
+        if products is None:
+            products = edf_products(X)
+        xx_term = np.real(products[0] * H[0, 0])
+        yy_term = np.real(products[1] * H[1, 1])
+        xy_term = 2 * np.real(products[2] * H[1, 0])
         edf = xx_term + yy_term + xy_term
 
         # CONNECTION TO THE HAT MATRIX:
@@ -213,6 +225,18 @@ class EffectiveDegreesOfFreedom(object):
         # points, so you can iteratively refine the inlier set.
 
         return edf
+
+
+def edf_products(X: np.ndarray) -> tuple:
+    """
+    The per-observation products used by EffectiveDegreesOfFreedom.compute_weights:
+    X[0] * conj(X[0]), X[1] * conj(X[1]) and conj(X[1]) * X[0].
+    """
+    return (
+        X[0, :] * np.conj(X[0, :]),
+        X[1, :] * np.conj(X[1, :]),
+        np.conj(X[1, :]) * X[0, :],
+    )
 
 
 def effective_degrees_of_freedom_weights(
@@ -324,12 +348,14 @@ def effective_degrees_of_freedom_weights(
     use = np.ones(n_observations_numeric, dtype=bool)
     # initialize use as a boolean of True, as large as XX
     n_valid_observations = n_observations_numeric
+    products = edf_products(XX)  # the same for every iteration
 
     while nOmit > 0:
-        eff_deg_of_freedom = edf_obj.compute_weights(XX, use)
+        eff_deg_of_freedom = edf_obj.compute_weights(XX, use, products=products)
         use = eff_deg_of_freedom <= edf_obj.edf_l1  # update "use" boolean selector
-        nOmit = n_valid_observations - sum(use)
-        n_valid_observations = sum(use)
+        n_use = np.count_nonzero(use)
+        nOmit = n_valid_observations - n_use
+        n_valid_observations = n_use
 
     wt = np.ones(n_observations_numeric)
     wt[eff_deg_of_freedom > edf_obj.p2] = 0
