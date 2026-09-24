@@ -258,7 +258,12 @@ def fft_xr_ds(
     for channel_id in dataset.keys():
         data = dataset[channel_id].data
         # Here is where you would add segment-by-segment prewhitening
-        fspec_array = np.fft.fft(data, axis=time_coordinate_index)
+        # Real windows: rfft returns only the non-negative harmonics. The slice
+        # below is a view, so a full fft kept both halves alive.
+        if np.isrealobj(data):
+            fspec_array = np.fft.rfft(data, axis=time_coordinate_index)
+        else:
+            fspec_array = np.fft.fft(data, axis=time_coordinate_index)
         fspec_array = fspec_array[:, 0:n_fft_harmonics]  # 1-sided
 
         xrd = xr.DataArray(
