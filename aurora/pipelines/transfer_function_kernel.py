@@ -131,6 +131,7 @@ class TransferFunctionKernel(object):
 
             # Assign additional columns to dataset_df, populate with mth5_objs and xr_ts
             self.dataset.initialize_dataframe_for_processing()
+            self.drop_unused_remote_channels()
 
             # APPLY TIMING CORRECTIONS HERE
         else:
@@ -157,6 +158,35 @@ class TransferFunctionKernel(object):
             f"Dataset Dataframe Updated for decimation level {i_dec_level} Successfully"
         )
         return
+
+    def drop_unused_remote_channels(self) -> None:
+        """
+        Keeps only the reference channels in the remote station's time series.
+
+        The regression uses only the remote's reference channels (usually hx, hy);
+        its other channels were decimated and Fourier transformed at every level and
+        never used. Nothing is dropped when a decimation level saves FCs or has
+        channel weight specs, whose features may read other remote channels.
+        """
+        if not self.config.stations.remote:
+            return
+        decimations = self.config.decimations
+        if any(d.save_fcs or d.channel_weight_specs for d in decimations):
+            return
+        reference_channels = {c for d in decimations for c in d.reference_channels}
+        for i, row in self.dataset_df.iterrows():
+            if not row.remote:
+                continue
+            channels = list(row.run_dataarray.channel.values)
+            keep = [c for c in channels if c in reference_channels]
+            if keep and len(keep) < len(channels):
+                self.dataset_df.at[i, "run_dataarray"] = row.run_dataarray.sel(
+                    channel=keep
+                )
+                logger.info(
+                    f"remote {row.station} {row.run}: dropped unused channels "
+                    f"{[c for c in channels if c not in keep]}"
+                )
 
     def apply_clock_zero(self, dec_level_config: AuroraDecimationLevel):
         """
