@@ -490,19 +490,24 @@ def run_ts_to_stft(
     windowed_obj = windowing_scheme.apply_sliding_window(
         run_xrds, dt=1.0 / decimation_obj.decimation.sample_rate
     )
-    if not np.prod(windowed_obj.to_array().data.shape):
+    del run_xrds  # the windows are copies
+    if not windowed_obj.data_vars or not all(
+        v.size for v in windowed_obj.data_vars.values()
+    ):
         raise ValueError
 
     windowed_obj = WindowedTimeSeries.detrend(data=windowed_obj, detrend_type="linear")
     tapered_obj = WindowedTimeSeries.apply_taper(
         data=windowed_obj, taper=windowing_scheme.taper
     )
+    del windowed_obj
     stft_obj = WindowedTimeSeries.apply_fft(
         data=tapered_obj,
         sample_rate=windowing_scheme.sample_rate,
         spectral_density_correction=windowing_scheme.linear_spectral_density_calibration_factor,
         detrend_type=decimation_obj.stft.per_window_detrend_type,
     )
+    del tapered_obj
 
     if decimation_obj.stft.recoloring:
         stft_obj = apply_recoloring(decimation_obj.stft.prewhitening_type, stft_obj)

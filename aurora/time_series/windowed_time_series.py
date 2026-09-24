@@ -145,7 +145,10 @@ class WindowedTimeSeries(object):
 
         """
         spectral_ds = fft_xr_ds(data, sample_rate, detrend_type=detrend_type)
-        spectral_ds *= spectral_density_correction
+        # spectral_ds is new: scale it in place (Dataset arithmetic, even *=,
+        # allocates a second copy)
+        for variable in spectral_ds.data_vars.values():
+            np.multiply(variable.data, spectral_density_correction, out=variable.data)
 
         return spectral_ds
 
