@@ -474,8 +474,9 @@ def process_transfer_functions_with_weights(
     Development Notes:
     Note #1: This is only for per-channel estimation, so it does not support the
     dec_level_config.estimator.estimate_per_channel = False
-    Note #2: This was adapted from the process_transfer_functions method but the core loop
-    is inverted to loop over channels first, then bands.
+    Note #2: This was adapted from the process_transfer_functions method. Each band
+    is extracted once and its regression is done per output channel, with that
+    channel's weights.
 
     Parameters
     ----------
@@ -501,24 +502,30 @@ def process_transfer_functions_with_weights(
         dec_level_config.estimator.engine
     )
     iter_control = set_up_iter_control(dec_level_config)
-    for ch in dec_level_config.output_channels:
 
-        # check if there are channel weights for this channel
+    # check if there are channel weights for each output channel
+    channel_weights = {}
+    for ch in dec_level_config.output_channels:
         weights = None
         channel_spec = None
         for chws in dec_level_config.channel_weight_specs:
             if ch in chws.output_channels:
                 weights = chws.weights
                 channel_spec = chws  # not the loop variable: that ends on the last spec
+        channel_weights[ch] = (weights, channel_spec)
 
-        for band in transfer_function_obj.frequency_bands.bands():
+    for band in transfer_function_obj.frequency_bands.bands():
 
-            X, Y, RR = get_band_for_tf_estimate(
-                band, dec_level_config, local_stft_obj, remote_stft_obj
-            )
-            keep = window_mask_for_band(dec_level_config, band, X.time.values)
-            X, Y, RR = apply_window_mask(X, Y, RR, keep)
-            Y_ch = Y[ch].to_dataset()  # keep as a dataset, maybe not needed
+        X_band, Y_band, RR_band = get_band_for_tf_estimate(
+            band, dec_level_config, local_stft_obj, remote_stft_obj
+        )
+        keep = window_mask_for_band(dec_level_config, band, X_band.time.values)
+        X_band, Y_band, RR_band = apply_window_mask(X_band, Y_band, RR_band, keep)
+
+        for ch in dec_level_config.output_channels:
+            weights, channel_spec = channel_weights[ch]
+            X, RR = X_band, RR_band
+            Y_ch = Y_band[ch].to_dataset()  # keep as a dataset, maybe not needed
 
             # extract the weights for this band
             if weights is not None:
@@ -531,6 +538,11 @@ def process_transfer_functions_with_weights(
                 if keep is not None:
                     band_weights = band_weights[keep]  # the windows the masks kept
 
+                # apply_weights scales X and RR in place: the band is shared
+                # by the output channels
+                X = X_band.copy(deep=False)
+                if RR_band is not None:
+                    RR = RR_band.copy(deep=False)
                 apply_weights(
                     X, Y_ch, RR, band_weights.squeeze(), segment=True, dropna=False
                 )
