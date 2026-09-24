@@ -190,7 +190,7 @@ def process_mth5_legacy(
         stfts = get_spectrograms(tfk, i_dec_level, units=units)
 
         local_merged_stft_obj, remote_merged_stft_obj = merge_stfts(stfts, tfk)
-        del stfts  # merge_stfts copies the per-run STFTs
+        del stfts  # merge_stfts empties the per-run lists
 
         # FC TF Interface here (see Note #3)
         try:

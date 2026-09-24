@@ -203,12 +203,57 @@ def time_axis_check_spectrograms(local_stfts: list, remote_stfts: list):
             )
 
 
+def concatenate_stfts(stfts: list) -> xr.Dataset:
+    """
+    Concatenates the STFTs of several runs along the time axis, emptying the list.
+
+    A single STFT is returned as it is. With several, each data variable is
+    concatenated in turn and dropped from the runs' STFTs once it has been copied.
+    STFTs with differing data variables, or with coordinates other than time and
+    frequency, are concatenated with xr.concat in one step.
+
+    Parameters
+    ----------
+    stfts: list
+        The STFTs (xr.Dataset) of the runs, in time order.
+
+    Returns
+    -------
+    merged: xr.Dataset
+        The STFTs concatenated along time.
+    """
+    if len(stfts) == 1:
+        return stfts.pop()
+    names = list(stfts[0].data_vars)
+    simple = all(
+        list(ds.data_vars) == names and set(ds.coords) <= {"time", "frequency"}
+        for ds in stfts
+    )
+    if not simple:
+        merged = xr.concat(stfts, "time")
+        stfts.clear()
+        return merged
+    attrs = stfts[0].attrs
+    coord_names = list(stfts[0].coords)
+    data_vars = {}
+    coords = {}
+    for name in names:
+        merged = xr.concat([ds[name] for ds in stfts], "time")
+        data_vars[name] = merged.variable
+        coords = {c: merged[c].variable for c in coord_names}
+        for i, ds in enumerate(stfts):
+            stfts[i] = ds.drop_vars(name)
+    stfts.clear()
+    return xr.Dataset(data_vars, coords=coords, attrs=attrs)
+
+
 def merge_stfts(stfts: dict, tfk: TransferFunctionKernel):
     """
 
     Applies concatenation along the time axis to multiple arrays of STFTs from different runs.
     At the TF estimation level we treat all the FCs in one array.
     This builds the array for both the local and the remote STFTs.
+    The lists of stfts are emptied (see concatenate_stfts).
 
     Parameters
     ----------
@@ -228,11 +273,11 @@ def merge_stfts(stfts: dict, tfk: TransferFunctionKernel):
     if tfk.config.stations.remote:
         local_stfts, remote_stfts = shape_check_spectrograms(local_stfts, remote_stfts)
         time_axis_check_spectrograms(local_stfts, remote_stfts)
-        remote_merged_stft_obj = xr.concat(remote_stfts, "time")
+        remote_merged_stft_obj = concatenate_stfts(remote_stfts)
     else:
         remote_merged_stft_obj = None
 
-    local_merged_stft_obj = xr.concat(local_stfts, "time")
+    local_merged_stft_obj = concatenate_stfts(local_stfts)
 
     return local_merged_stft_obj, remote_merged_stft_obj
 
