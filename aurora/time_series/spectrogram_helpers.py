@@ -4,26 +4,27 @@ In future these tools should be moved to MTH5 and made methods of the Spectrogra
 For now, we can use this module as a place to aggregate functions to migrate.
 """
 
-from aurora.config.metadata.processing import Processing as AuroraProcessing
-from aurora.pipelines.time_series_helpers import truncate_to_clock_zero
-from aurora.pipelines.transfer_function_kernel import station_obj_from_row
-from aurora.pipelines.transfer_function_kernel import TransferFunctionKernel
-from aurora.sandbox.triage_metadata import triage_run_id
-from aurora.time_series.xarray_helpers import nan_to_mean
-from aurora.time_series.xarray_helpers import time_axis_match
-from aurora.time_series.windowed_time_series import WindowedTimeSeries
-from aurora.time_series.windowing_scheme import window_scheme_from_decimation
-from loguru import logger
-from mt_metadata.processing.aurora import DecimationLevel as AuroraDecimationLevel
-from mth5.groups import RunGroup
-from mth5.processing.spectre.prewhitening import apply_prewhitening
-from mth5.processing.spectre.prewhitening import apply_recoloring
 from typing import Literal, Optional
 
 import mth5.timeseries.spectre as spectre
 import numpy as np
 import pandas as pd
 import xarray as xr
+from loguru import logger
+from mt_metadata.processing.aurora import DecimationLevel as AuroraDecimationLevel
+from mth5.groups import RunGroup
+from mth5.processing.spectre.prewhitening import apply_prewhitening, apply_recoloring
+
+from aurora.config.metadata.processing import Processing as AuroraProcessing
+from aurora.pipelines.time_series_helpers import truncate_to_clock_zero
+from aurora.pipelines.transfer_function_kernel import (
+    station_obj_from_row,
+    TransferFunctionKernel,
+)
+from aurora.sandbox.triage_metadata import triage_run_id
+from aurora.time_series.windowed_time_series import WindowedTimeSeries
+from aurora.time_series.windowing_scheme import window_scheme_from_decimation
+from aurora.time_series.xarray_helpers import nan_to_mean, time_axis_match
 
 
 def make_stft_objects(
@@ -32,6 +33,7 @@ def make_stft_objects(
     run_obj: RunGroup,
     run_xrds: xr.Dataset,
     units: Literal["MT", "SI"] = "MT",
+    calibration_filters: Optional[dict] = None,
 ) -> xr.Dataset:
     """
     Applies STFT to all channel time series in the input run.
@@ -52,6 +54,8 @@ def make_stft_objects(
         The data time series from the run to transform
     units: Literal["MT", "SI"] = "MT",
         expects "MT".  May change so that this is the only accepted set of units
+    calibration_filters: Optional[dict]
+        The run's calibration filters by channel, passed to calibrate_stft_obj.
 
     Returns
     -------
@@ -118,6 +122,7 @@ def make_stft_objects(
         run_obj,
         units=units,
         channel_scale_factors=scale_factors,
+        calibration_filters=calibration_filters,
     )
 
     return stft_obj
@@ -417,6 +422,8 @@ def get_spectrograms(
     stfts = {}
     stfts["local"] = []
     stfts["remote"] = []
+    # calibration filters of each run, kept on the kernel for all decimation levels
+    run_calibration_filters = getattr(tfk, "calibration_filters", None)
 
     # Check first if TS processing or accessing FC Levels
     for i, row in tfk.dataset_df.iterrows():
@@ -438,12 +445,17 @@ def get_spectrograms(
         # Musgraves workaround for old MT data
         triage_run_id(row.run, run_obj)
 
+        calibration_filters = None
+        if run_calibration_filters is not None:
+            key = (str(row.mth5_path), row.survey, row.station, row.run)
+            calibration_filters = run_calibration_filters.setdefault(key, {})
         stft_obj = make_stft_objects(
             tfk.config,
             i_dec_level,
             run_obj,
             run_xrds,
             units,
+            calibration_filters=calibration_filters,
         )
         # TODO: Cast stft_obj to a Spectrogram here or in make_stft_objects
 
@@ -516,11 +528,52 @@ def run_ts_to_stft(
     return spectrogram
 
 
+def get_calibration_filters(run_obj: RunGroup, channel_id: str) -> tuple:
+    """
+    Returns the channel response of a channel and the filters calibration removes.
+
+    Parameters
+    ----------
+    run_obj : mth5.groups.master_station_run_channel.RunGroup
+        The run the channel belongs to.
+    channel_id : str
+        The channel.
+
+    Returns
+    -------
+    channel_response : mt_metadata.timeseries.filters.ChannelResponse
+        The channel's response (that of hx for an hy without filters).
+    filters_to_remove : list
+        The applied filters of the response, without decimation and delay filters.
+    """
+    channel = run_obj.get_channel(channel_id)
+    channel_response = channel.channel_response
+    if not channel_response.filters_list:
+        msg = f"Channel {channel_id} with empty filters list detected"
+        logger.warning(msg)
+        if channel_id == "hy":
+            msg = "Channel hy has no filters, try using filters from hx"
+            logger.warning(msg)
+            channel_response = run_obj.get_channel("hx").channel_response
+
+    indices_to_flip = channel_response.get_indices_of_filters_to_remove(
+        include_decimation=False, include_delay=False
+    )
+    indices_to_flip = [
+        i for i in indices_to_flip if channel.metadata.filters[i].applied
+    ]
+    filters_to_remove = [channel_response.filters_list[i] for i in indices_to_flip]
+    if not filters_to_remove:
+        logger.warning("No filters to remove")
+    return channel_response, filters_to_remove
+
+
 def calibrate_stft_obj(
     stft_obj: xr.Dataset,
     run_obj: RunGroup,
     units: Literal["MT", "SI"] = "MT",
     channel_scale_factors: Optional[dict] = None,
+    calibration_filters: Optional[dict] = None,
 ) -> xr.Dataset:
     """
     Calibrates frequency domain data into MT units.
@@ -541,6 +594,10 @@ def calibrate_stft_obj(
         Keyed by channel, supports a single scalar to apply to that channels data
         Useful for debugging.  Should not be used in production and should throw a
         warning if it is not None
+    calibration_filters : Optional[dict]
+        Keyed by channel, the (channel_response, filters_to_remove) of
+        get_calibration_filters for this run; a missing channel is added. When None,
+        they are read from run_obj for every channel.
 
     Returns
     -------
@@ -549,25 +606,16 @@ def calibrate_stft_obj(
     """
     for channel_id in stft_obj.keys():
 
-        channel = run_obj.get_channel(channel_id)
-        channel_response = channel.channel_response
-        if not channel_response.filters_list:
-            msg = f"Channel {channel_id} with empty filters list detected"
-            logger.warning(msg)
-            if channel_id == "hy":
-                msg = "Channel hy has no filters, try using filters from hx"
-                logger.warning(msg)
-                channel_response = run_obj.get_channel("hx").channel_response
-
-        indices_to_flip = channel_response.get_indices_of_filters_to_remove(
-            include_decimation=False, include_delay=False
-        )
-        indices_to_flip = [
-            i for i in indices_to_flip if channel.metadata.filters[i].applied
-        ]
-        filters_to_remove = [channel_response.filters_list[i] for i in indices_to_flip]
-        if not filters_to_remove:
-            logger.warning("No filters to remove")
+        if calibration_filters is None:
+            channel_response, filters_to_remove = get_calibration_filters(
+                run_obj, channel_id
+            )
+        else:
+            if channel_id not in calibration_filters:
+                calibration_filters[channel_id] = get_calibration_filters(
+                    run_obj, channel_id
+                )
+            channel_response, filters_to_remove = calibration_filters[channel_id]
 
         calibration_response = channel_response.complex_response(
             stft_obj.frequency.data, filters_list=filters_to_remove

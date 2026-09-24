@@ -46,6 +46,17 @@ class TransferFunctionKernel(object):
         self._dataset = dataset
         self._mth5_objs = None
         self._memory_warning = False
+        self._calibration_filters = {}
+
+    @property
+    def calibration_filters(self) -> dict:
+        """
+        The calibration filters of each run, for all decimation levels.
+
+        Keyed by (mth5 path, survey, station, run); each value is keyed by channel,
+        as the calibration_filters of calibrate_stft_obj.
+        """
+        return self._calibration_filters
 
     @property
     def dataset(self) -> KernelDataset:
