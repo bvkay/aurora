@@ -2,10 +2,11 @@
 Placeholder module for methods manipulating xarray time series
 """
 
+from typing import Optional
+
 import numpy as np
 import xarray as xr
 from loguru import logger
-from typing import Optional
 
 
 def handle_nan(
@@ -26,6 +27,9 @@ def handle_nan(
     local the other channels in X, Y.
 
     It would be nice to maintain an index of what was dropped.
+
+    Coordinates that are not indexes, such as the time and frequency of the
+    observations of stacked FCs, are taken from X in the merge.
 
     Development Note: Even if there are no NaNs in the data, this function can still encounter issues,
     in particular if the time coordinates of X and RR do not match exactly.
@@ -75,17 +79,17 @@ def handle_nan(
         data_var_rm_label_mapper[f"remote_{ch}"] = ch
     RR = RR.rename(data_var_add_label_mapper)
 
-    merged_xr = X.merge(Y, join="exact")
+    merged_xr = X.merge(Y, join="exact", compat="override")
     if time_axis_problem:
         # If the time axes do not match, we cannot merge them directly.
         # Instead, we will merge RR with a left join, which will keep all timestamps from
         # X and Y, and fill in the missing values from RR where available.
-        merged_xr = merged_xr.merge(RR, join="left")
+        merged_xr = merged_xr.merge(RR, join="left", compat="override")
         for ch in list(RR.keys()):
             merged_xr[ch].values = RR[ch].values
     else:
         # If the time axes match, we can merge them directly.
-        merged_xr = merged_xr.merge(RR, join="exact")
+        merged_xr = merged_xr.merge(RR, join="exact", compat="override")
         logger.debug("Time axes match, merging datasets")
 
     # Drop NaN values across the specified dimension

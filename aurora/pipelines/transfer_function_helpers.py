@@ -8,25 +8,26 @@ Development Notes:
 
 """
 
+from typing import Literal, Optional, Union
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+from loguru import logger
+from mt_metadata.processing.aurora.decimation_level import (
+    DecimationLevel as AuroraDecimationLevel,
+)
+
 from aurora.time_series.frequency_band_helpers import get_band_for_tf_estimate
 from aurora.time_series.xarray_helpers import handle_nan
 from aurora.transfer_function.regression.base import RegressionEstimator
 from aurora.transfer_function.regression.iter_control import IterControl
 from aurora.transfer_function.regression.RME import RME
 from aurora.transfer_function.regression.RME_RR import RME_RR
-
 from aurora.transfer_function.weights.edf_weights import (
     effective_degrees_of_freedom_weights,
 )
-from mt_metadata.processing.aurora.decimation_level import (
-    DecimationLevel as AuroraDecimationLevel,
-)
-from loguru import logger
-from typing import Literal, Optional, Union
 
-import numpy as np
-import pandas as pd
-import xarray as xr
 
 ESTIMATOR_LIBRARY = {"OLS": RegressionEstimator, "RME": RME, "RME_RR": RME_RR}
 SUPPORTED_REGRESSION_ESTIMATOR = Literal["OLS", "RME", "RME_RR"]
@@ -138,6 +139,42 @@ def drop_nans(X: xr.Dataset, Y: xr.Dataset, RR: Union[xr.Dataset, None]) -> tupl
     return X, Y, RR
 
 
+def stack_frequency_time(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Ravels the frequency and time dimensions of a dataset into one "observation" dimension.
+
+    The observations are frequency-major (the time index varies fastest), the order
+    of ``ds.stack(observation=("frequency", "time"))``. The frequency and time of
+    each observation are kept as coordinates on the observation dimension, which
+    has no index.
+
+    Parameters
+    ----------
+    ds: xarray.core.dataset.Dataset
+        Every data variable has the dimensions frequency and time.
+
+    Returns
+    -------
+    stacked: xarray.core.dataset.Dataset
+        Same data variables as the input with the frequency and time dimensions
+        replaced by observation.
+    """
+    n_frequency = ds.sizes["frequency"]
+    n_time = ds.sizes["time"]
+    data_vars = {}
+    for name, var in ds.data_vars.items():
+        var = var.variable.transpose(..., "frequency", "time")
+        data = np.reshape(var.data, var.shape[:-2] + (n_frequency * n_time,))
+        data_vars[name] = xr.Variable(
+            var.dims[:-2] + ("observation",), data, attrs=var.attrs
+        )
+    coords = {
+        "frequency": ("observation", np.repeat(ds.frequency.values, n_time)),
+        "time": ("observation", np.tile(ds.time.values, n_frequency)),
+    }
+    return xr.Dataset(data_vars, coords=coords, attrs=ds.attrs)
+
+
 def stack_fcs(X, Y, RR):
     """
     Reshape 2D arrays of frequency and time to 1D.
@@ -149,6 +186,8 @@ def stack_fcs(X, Y, RR):
     put into a 1D array.  This method performs that reshaping (ravelling) operation.
     It is not important how we unravel the FCs but it is important that the same indexing
     scheme is used for X, Y and RR.
+
+    The stacked observation dimension has no index (see stack_frequency_time).
 
     TODO: Consider this take a list and return a list rather than X,Y,RR
 
@@ -164,10 +203,10 @@ def stack_fcs(X, Y, RR):
     -------
     X, Y, RR: Same as input but with stacked time and frequency dimensions
     """
-    X = X.stack(observation=("frequency", "time"))
-    Y = Y.stack(observation=("frequency", "time"))
+    X = stack_frequency_time(X)
+    Y = stack_frequency_time(Y)
     if RR is not None:
-        RR = RR.stack(observation=("frequency", "time"))
+        RR = stack_frequency_time(RR)
     return X, Y, RR
 
 
