@@ -76,7 +76,7 @@ class EffectiveDegreesOfFreedom(object):
         self,
         X: np.ndarray,
         use: np.ndarray,
-        products: Optional[tuple] = None,
+        products: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Compute the EDF Weights
@@ -150,10 +150,10 @@ class EffectiveDegreesOfFreedom(object):
             The data to for which to determine weights.
         use : np.ndarray
             populated with booleans
-        products : tuple or None
-            (X[0] * conj(X[0]), X[1] * conj(X[1]), conj(X[1]) * X[0]), as returned by
-            edf_products(X). Computed here when None. Pass them when calling repeatedly
-            with the same X.
+        products : np.ndarray or None
+            The per-observation products of X as returned by edf_products(X).
+            Computed here when None. Pass them when calling repeatedly with the
+            same X.
 
         Returns
         -------
@@ -161,8 +161,14 @@ class EffectiveDegreesOfFreedom(object):
             The weights values.
 
         """
-        X_use = X[:, use]
-        S = X_use @ np.conj(X_use).T  # covariance matrix, 2x2
+        if products is None:
+            products = edf_products(X)
+        # covariance matrix of the used observations, 2x2: the sums of the
+        # products over `use`, without copying the used columns of X
+        s = products @ use.astype(np.float64)
+        S = np.array(
+            [[s[0], s[2] + 1j * s[3]], [s[2] - 1j * s[3], s[1]]], dtype=np.complex128
+        )
         S /= np.count_nonzero(use)  # normalize by the number of datapoints
 
         # if H is singular then set to zeros otherwise an error is raised
@@ -194,12 +200,14 @@ class EffectiveDegreesOfFreedom(object):
         # - The covariance matrix is computed from the inliers (`use`).
         # - The leverage (EDF) is computed for all points, using the inlier covariance.
         # - This lets the algorithm decide which points to drop next, based on their leverage under the current model.
-        if products is None:
-            products = edf_products(X)
-        xx_term = np.real(products[0] * H[0, 0])
-        yy_term = np.real(products[1] * H[1, 1])
-        xy_term = 2 * np.real(products[2] * H[1, 0])
-        edf = xx_term + yy_term + xy_term
+        # xx_term + yy_term + xy_term, with
+        # xx_term = Re(X[0] * conj(X[0]) * H[0, 0]),
+        # yy_term = Re(X[1] * conj(X[1]) * H[1, 1]),
+        # xy_term = 2 * Re(conj(X[1]) * X[0] * H[1, 0])
+        coefficients = np.array(
+            [H[0, 0].real, H[1, 1].real, 2 * H[1, 0].real, -2 * H[1, 0].imag]
+        )
+        edf = coefficients @ products
 
         # CONNECTION TO THE HAT MATRIX:
         # In linear regression, the projection or "hat" matrix P maps observed data to fitted values,
@@ -227,15 +235,30 @@ class EffectiveDegreesOfFreedom(object):
         return edf
 
 
-def edf_products(X: np.ndarray) -> tuple:
+def edf_products(X: np.ndarray) -> np.ndarray:
     """
-    The per-observation products used by EffectiveDegreesOfFreedom.compute_weights:
-    X[0] * conj(X[0]), X[1] * conj(X[1]) and conj(X[1]) * X[0].
+    The per-observation products used by EffectiveDegreesOfFreedom.compute_weights.
+
+    Parameters
+    ----------
+    X: np.ndarray
+        Complex array of shape (2, n_observations).
+
+    Returns
+    -------
+    products: np.ndarray
+        Real array of shape (4, n_observations), the rows being
+        Re(X[0] * conj(X[0])), Re(X[1] * conj(X[1])), Re(conj(X[1]) * X[0]) and
+        Im(conj(X[1]) * X[0]).
     """
-    return (
-        X[0, :] * np.conj(X[0, :]),
-        X[1, :] * np.conj(X[1, :]),
-        np.conj(X[1, :]) * X[0, :],
+    cross = np.conj(X[1, :]) * X[0, :]
+    return np.stack(
+        [
+            (X[0, :] * np.conj(X[0, :])).real,
+            (X[1, :] * np.conj(X[1, :])).real,
+            cross.real,
+            cross.imag,
+        ]
     )
 
 
