@@ -1,6 +1,9 @@
 """
     Collection of modules used in processing pipeline that operate on time series
 """
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import mt_metadata
 import numpy as np
 import pandas as pd
@@ -17,6 +20,44 @@ from mt_metadata.processing.fourier_coefficients import Decimation as FCDecimati
 
 from mth5.groups import RunGroup
 from typing import Union
+
+
+# The most threads prototype_decimate decimates channels in at once; 1 decimates
+# them in turn.
+DECIMATE_MAX_WORKERS = 4
+# The most memory, in bytes, the decimating threads may hold in filter
+# intermediates at once, a thread counted as three float64 copies of its channel.
+# A long record is decimated in fewer threads, and in turn once three copies of
+# a channel exceed it. 8 GiB allows 4 threads on a 6 h record at 1000 Hz and 2 on
+# a 44.9 h record, whose decimation then stays under the level-0 regression peak.
+DECIMATE_MAX_TRANSIENT_BYTES = 8 * 2**30
+
+
+def decimate_num_workers(num_channels: int, num_samples: int) -> int:
+    """
+    The number of threads prototype_decimate decimates the channels of a run in.
+
+    No more than DECIMATE_MAX_WORKERS, the channels or the CPUs, and no more than
+    DECIMATE_MAX_TRANSIENT_BYTES allows when each thread holds three float64
+    copies of its channel; at least 1.
+
+    Parameters
+    ----------
+    num_channels : int
+        The number of channels to decimate.
+    num_samples : int
+        The number of samples of each channel.
+
+    Returns
+    -------
+    int
+        The number of threads; 1 decimates the channels in turn.
+    """
+    per_thread = 3 * np.dtype(np.float64).itemsize * max(num_samples, 1)
+    by_memory = DECIMATE_MAX_TRANSIENT_BYTES // per_thread
+    return max(
+        1, min(DECIMATE_MAX_WORKERS, num_channels, os.cpu_count() or 1, by_memory)
+    )
 
 
 def truncate_to_clock_zero(
@@ -82,6 +123,13 @@ def prototype_decimate(
     TODO: Compare outputs with scipy resample_poly, which also has an FIR AAF and appears faster
     TODO: Add handling for case that could occur when sliced time axis has a different length than the decimated data -- see mth5 issue #217 https://github.com/kujaku11/mth5/issues/217
 
+    The channels are decimated in up to DECIMATE_MAX_WORKERS threads at once (scipy's
+    filters release the GIL), each channel by the same scipy.signal.decimate call as
+    one after the other. A thread holds its channel's filter intermediates
+    (sosfiltfilt keeps about three copies of the channel) until the channel is done,
+    so the threads are also bounded by DECIMATE_MAX_TRANSIENT_BYTES
+    (decimate_num_workers): a long record is decimated in fewer threads, or in turn.
+
     Parameters
     ----------
     ts_decimation : AuroraDecimationLevel
@@ -103,9 +151,19 @@ def prototype_decimate(
     channel_labels = list(run_xrds.data_vars.keys())  # run_ts.channels
     num_channels = len(channel_labels)
     new_data = np.full((num_observations, num_channels), np.nan)
-    for i_ch, ch_label in enumerate(channel_labels):
+    channels = [run_xrds[ch_label].data for ch_label in channel_labels]
+
+    def decimate_channel(i_ch: int) -> None:
         # TODO: add check here for ts_decimation.anti_alias_filter
-        new_data[:, i_ch] = ssig.decimate(run_xrds[ch_label], int(ts_decimation.factor))
+        new_data[:, i_ch] = ssig.decimate(channels[i_ch], int(ts_decimation.factor))
+
+    num_workers = decimate_num_workers(num_channels, run_xrds.sizes["time"])
+    if num_workers > 1:
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            list(pool.map(decimate_channel, range(num_channels)))
+    else:
+        for i_ch in range(num_channels):
+            decimate_channel(i_ch)
 
     xr_da = xr.DataArray(
         new_data,
