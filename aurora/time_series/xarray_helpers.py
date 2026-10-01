@@ -31,6 +31,17 @@ def handle_nan(
     Coordinates that are not indexes, such as the time and frequency of the
     observations of stacked FCs, are taken from X in the merge.
 
+    When every value of X, Y and RR is finite and they are laid out as the
+    weighted regression passes them (see merge_returns_inputs), X, Y and RR
+    are returned as they are, without the merge and the copies it makes. For
+    inputs in this layout the tests find the datasets of the merge identical
+    to the inputs. Any other input takes the merge as before. A drop_dim that
+    is not a dimension of the data, Y or RR on other frequencies, a "channel"
+    dimension or a channel name that is not a str still raise. Mixed dtypes,
+    shared names, another dimension order, other attributes or a "channel"
+    coordinate are still rewritten by the merge. With Y or RR None the merge
+    runs too.
+
     Development Note: Even if there are no NaNs in the data, this function can still encounter issues,
     in particular if the time coordinates of X and RR do not match exactly.
     In this case, the merge will fail, and we will log an error message.
@@ -63,6 +74,8 @@ def handle_nan(
         time_axis_problem = True
         logger.error("Time axes do not match, merging datasets with left join")
         logger.error("This may lead to unexpected results, please check your data.")
+    elif merge_returns_inputs(X, Y, RR, drop_dim) and all_finite(X, Y, RR):
+        return X, Y, RR
 
     if Y is None:
         Y = xr.Dataset()
@@ -106,6 +119,125 @@ def handle_nan(
     RR = RR.rename(data_var_rm_label_mapper)
 
     return X, Y, RR
+
+
+def all_finite(*datasets: Optional[xr.Dataset]) -> bool:
+    """
+    Check that every value of the data variables of some datasets is finite.
+
+    Parameters
+    ----------
+    datasets : xr.Dataset or None
+        The datasets to check. None is skipped.
+
+    Returns
+    -------
+    bool
+        True if every value of every data variable is finite. A data
+        variable that is not numeric counts as not finite.
+    """
+    for ds in datasets:
+        if ds is None:
+            continue
+        for var in ds.data_vars.values():
+            if var.dtype.kind not in "biufc":
+                return False
+            if not np.isfinite(var.data).all():
+                return False
+    return True
+
+
+def same_coordinates(X: xr.Dataset, *datasets: Optional[xr.Dataset], dim: str) -> bool:
+    """
+    Check that some datasets have the length of X on a dimension and X's coordinates.
+
+    The coordinates are compared as ds.coords.to_dataset(), which keeps the
+    dataset attributes, so a dataset with other attributes than X does not
+    match either.
+
+    Parameters
+    ----------
+    X : xr.Dataset
+        The dataset to compare with.
+    datasets : xr.Dataset or None
+        The datasets to check. None is skipped.
+    dim : str
+        The dimension, which X and every dataset must have.
+
+    Returns
+    -------
+    bool
+        True if dim is a dimension of X and of every dataset, with the same
+        length, and the coordinates of every dataset are identical to X's
+        (names, values and attributes), as are its dataset attributes.
+    """
+    if dim not in X.dims:
+        return False
+    x_coords = X.coords.to_dataset()
+    for ds in datasets:
+        if ds is None:
+            continue
+        if ds.sizes.get(dim) != X.sizes[dim]:
+            return False
+        if not ds.coords.to_dataset().identical(x_coords):
+            return False
+    return True
+
+
+def merge_returns_inputs(
+    X: xr.Dataset,
+    Y: Optional[xr.Dataset],
+    RR: Optional[xr.Dataset],
+    drop_dim: str,
+) -> bool:
+    """
+    Check that X, Y and RR are laid out as the weighted regression passes them.
+
+    The merge, dropna and split of handle_nan take the coordinates and dataset
+    attributes of X, drop the attributes of the data variables, cast them to
+    one dtype and put each in X's dimension order. to_array(dim="channel")
+    drops a "channel" coordinate and clashes with a "channel" dimension, and
+    the split raises KeyError on integer channel names. Inputs outside this
+    layout can therefore come back changed, or make the merge raise. For
+    inputs in this layout with no NaN, the tests find the datasets of the
+    merge identical to X, Y and RR (xarray identical).
+
+    Parameters
+    ----------
+    X : xr.Dataset
+    Y : xr.Dataset or None
+    RR : xr.Dataset or None
+    drop_dim : str
+        The dimension on which dropna would run.
+
+    Returns
+    -------
+    bool
+        True if Y and RR are given; X has no "channel" dimension or
+        coordinate; every data variable of X, Y and RR is one-dimensional on
+        drop_dim, has no attributes and has one dtype; every channel name is a
+        str; the names of X, Y and RR (the latter with the "remote_" prefix)
+        are distinct and are not coordinates; and Y and RR have X's length on
+        drop_dim, X's coordinates and X's dataset attributes
+        (same_coordinates).
+    """
+    if Y is None or RR is None:
+        return False
+    if "channel" in X.dims or "channel" in X.coords:
+        return False
+    data_vars = [var for ds in (X, Y, RR) for var in ds.data_vars.values()]
+    if any(var.dims != (drop_dim,) or var.attrs for var in data_vars):
+        return False
+    if len({var.dtype for var in data_vars}) > 1:
+        return False
+    channels = [ch for ds in (X, Y, RR) for ch in ds.data_vars]
+    if not all(isinstance(ch, str) for ch in channels):
+        return False
+    names = list(X.data_vars) + list(Y.data_vars)
+    names += [f"remote_{ch}" for ch in RR.data_vars]
+    if len(set(names)) != len(names) or set(names) & set(X.coords):
+        return False
+    return same_coordinates(X, Y, RR, dim=drop_dim)
 
 
 def time_axis_match(

@@ -19,7 +19,11 @@ from mt_metadata.processing.aurora.decimation_level import (
 )
 
 from aurora.time_series.frequency_band_helpers import get_band_for_tf_estimate
-from aurora.time_series.xarray_helpers import handle_nan
+from aurora.time_series.xarray_helpers import (
+    all_finite,
+    handle_nan,
+    same_coordinates,
+)
 from aurora.transfer_function.regression.base import RegressionEstimator
 from aurora.transfer_function.regression.iter_control import IterControl
 from aurora.transfer_function.regression.RME import RME
@@ -97,8 +101,27 @@ def set_up_iter_control(config: AuroraDecimationLevel):
 def drop_nans(X: xr.Dataset, Y: xr.Dataset, RR: Union[xr.Dataset, None]) -> tuple:
     """
     Drops any observation where any variable in X, Y, or RR is NaN.
+
+    When Y is given, X, Y and RR (if given) have data variables, Y and RR
+    have the "observation" dimension of X with its length, X's coordinates
+    and X's dataset attributes (same_coordinates), and every value is
+    finite, isel would return copies identical to the inputs, so X, Y and
+    RR are returned as they are. Any other input takes isel as before.
+    Data without an "observation" dimension still raise ValueError. Y or
+    RR on other observations, Y None or a dataset without data variables
+    still raise. Y or RR with other dataset attributes are copied with
+    their own.
     """
     import numpy as np
+
+    datasets = [ds for ds in (X, Y, RR) if ds is not None]
+    stacked = (
+        Y is not None
+        and all(ds.data_vars for ds in datasets)
+        and same_coordinates(X, Y, RR, dim="observation")
+    )
+    if stacked and all_finite(X, Y, RR):
+        return X, Y, RR
 
     def get_obs_mask(ds):
         """

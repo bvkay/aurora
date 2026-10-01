@@ -581,3 +581,290 @@ class TestHandleNanDataIntegrity:
         assert len(X.time) == original_x_len
         assert len(Y.time) == original_y_len
         assert np.isnan(X.hx.values[1])  # NaN still present
+
+
+def _stacked_fcs(channels, seed, n_observation=60):
+    """Stacked Fourier coefficients: complex data on an observation dimension
+    with the frequency and time of each observation as coordinates."""
+    rng = np.random.default_rng(seed)
+    n_time = n_observation // 2
+    coords = {
+        "frequency": ("observation", np.repeat([0.10, 0.11], n_time)),
+        "time": ("observation", np.tile(np.arange(n_time), 2)),
+    }
+    data_vars = {
+        ch: (
+            "observation",
+            rng.normal(size=n_observation) + 1j * rng.normal(size=n_observation),
+        )
+        for ch in channels
+    }
+    return xr.Dataset(data_vars, coords=coords)
+
+
+class TestHandleNanAllFinite:
+    """Test handle_nan on finite data, and that it keeps infinite values."""
+
+    def test_handle_nan_all_finite_returns_inputs(self):
+        """With Y and RR, matching time axes and no NaN, the inputs are returned as they are."""
+        X = _stacked_fcs(["hx", "hy"], seed=1)
+        Y = _stacked_fcs(["ex"], seed=2)
+        RR = _stacked_fcs(["hx", "hy"], seed=3)
+
+        X_out, Y_out, RR_out = handle_nan(X, Y, RR, drop_dim="observation")
+
+        assert X_out is X
+        assert Y_out is Y
+        assert RR_out is RR
+
+    def test_handle_nan_all_finite_same_as_merge_path(self):
+        """The merge path, made to run by one more observation with a NaN in Y, gives the same X, Y and RR."""
+        X = _stacked_fcs(["hx", "hy"], seed=1)
+        Y = _stacked_fcs(["ex", "ey"], seed=2)
+        RR = _stacked_fcs(["hx", "hy"], seed=3)
+
+        def append_observation(ds, value=None):
+            extra = ds.isel(observation=[0]).copy(deep=True)
+            if value is not None:
+                for name in extra.data_vars:
+                    extra[name].values[:] = value
+            return xr.concat([ds, extra], dim="observation")
+
+        X_ref, Y_ref, RR_ref = handle_nan(
+            append_observation(X),
+            append_observation(Y, np.nan),
+            append_observation(RR),
+            drop_dim="observation",
+        )
+        X_out, Y_out, RR_out = handle_nan(X, Y, RR, drop_dim="observation")
+
+        assert X_ref.sizes["observation"] == X.sizes["observation"]
+        xr.testing.assert_identical(X_out, X_ref)
+        xr.testing.assert_identical(Y_out, Y_ref)
+        xr.testing.assert_identical(RR_out, RR_ref)
+
+    def test_handle_nan_all_finite_mismatched_time_axes_merged(self):
+        """With Y and RR given and every value finite, but RR on other times, the
+        merge runs: RR comes back on X's times with its own values."""
+        times = np.array([0.0, 1.0, 2.0, 3.0])
+        X = xr.Dataset({"hx": ("time", [1.0, 2.0, 3.0, 4.0])}, coords={"time": times})
+        Y = xr.Dataset({"ex": ("time", [5.0, 6.0, 7.0, 8.0])}, coords={"time": times})
+        RR = xr.Dataset(
+            {"hx": ("time", [9.0, 10.0, 11.0, 12.0])}, coords={"time": times + 0.1}
+        )
+
+        X_out, Y_out, RR_out = handle_nan(X, Y, RR, drop_dim="time")
+
+        assert RR_out is not RR
+        np.testing.assert_array_equal(RR_out.time.values, times)
+        np.testing.assert_array_equal(RR_out.hx.values, RR.hx.values)
+        np.testing.assert_array_equal(X_out.hx.values, X.hx.values)
+        np.testing.assert_array_equal(Y_out.ex.values, Y.ex.values)
+
+    @pytest.mark.parametrize("drop_dim", ["", "time"])
+    def test_handle_nan_all_finite_drop_dim_not_a_dimension_raises(self, drop_dim):
+        """A drop_dim that is not a dimension of the data raises ValueError, as it
+        does when there is a NaN to drop."""
+        X = _stacked_fcs(["hx", "hy"], seed=1)
+        Y = _stacked_fcs(["ex"], seed=2)
+        RR = _stacked_fcs(["hx", "hy"], seed=3)
+
+        with pytest.raises(ValueError):
+            handle_nan(X, Y, RR, drop_dim=drop_dim)
+
+    def test_handle_nan_all_finite_mixed_dtypes_cast_as_merge(self):
+        """A real Y with complex X and RR comes back complex, as from the merge."""
+        X = _stacked_fcs(["hx", "hy"], seed=1)
+        Y = _stacked_fcs(["ex"], seed=2)
+        Y["ex"] = Y["ex"].real
+        RR = _stacked_fcs(["hx", "hy"], seed=3)
+
+        X_out, Y_out, RR_out = handle_nan(X, Y, RR, drop_dim="observation")
+
+        assert Y_out["ex"].dtype == np.complex128
+        np.testing.assert_array_equal(Y_out["ex"].values, Y["ex"].values)
+        xr.testing.assert_identical(X_out, X)
+        xr.testing.assert_identical(RR_out, RR)
+
+    def test_handle_nan_infinite_values_kept(self):
+        """Only NaN is dropped: an infinite value stays, as before."""
+        X = _stacked_fcs(["hx", "hy"], seed=1)
+        Y = _stacked_fcs(["ex"], seed=2)
+        RR = _stacked_fcs(["hx", "hy"], seed=3)
+        X["hx"].values[5] = np.inf
+        RR["hy"].values[9] = np.nan
+
+        X_out, Y_out, RR_out = handle_nan(X, Y, RR, drop_dim="observation")
+
+        keep = np.ones(X.sizes["observation"], dtype=bool)
+        keep[9] = False
+        assert X_out.sizes["observation"] == keep.sum()
+        assert np.isinf(X_out["hx"].values[5])
+        np.testing.assert_array_equal(X_out["hx"].values, X["hx"].values[keep])
+        np.testing.assert_array_equal(Y_out["ex"].values, Y["ex"].values[keep])
+        np.testing.assert_array_equal(RR_out["hx"].values, RR["hx"].values[keep])
+
+
+def _stft_fcs(channels, seed, frequencies, dims=("time", "frequency")):
+    """Unstacked Fourier coefficients: complex data on time and frequency."""
+    rng = np.random.default_rng(seed)
+    times = np.arange(5).astype("datetime64[s]").astype("datetime64[ns]")
+    sizes = {"time": len(times), "frequency": len(frequencies)}
+    shape = tuple(sizes[d] for d in dims)
+    data_vars = {
+        ch: (dims, rng.normal(size=shape) + 1j * rng.normal(size=shape))
+        for ch in channels
+    }
+    return xr.Dataset(data_vars, coords={"time": times, "frequency": frequencies})
+
+
+class TestHandleNanAllFiniteOtherLayouts:
+    """Test that all-finite inputs in another layout than the regression's still
+    take the merge, which raises or rewrites them as before."""
+
+    FREQUENCIES = np.array([0.1, 0.2, 0.3])
+
+    @pytest.mark.parametrize(
+        "Y_frequencies, RR_frequencies",
+        [(FREQUENCIES + 0.05, FREQUENCIES), (FREQUENCIES, FREQUENCIES[:2])],
+        ids=["Y", "RR"],
+    )
+    def test_other_frequencies_raise(self, Y_frequencies, RR_frequencies):
+        """3D STFTs with Y or RR on other frequencies than X, dropped on time,
+        raise ValueError from the exact join of the merge."""
+        X = _stft_fcs(["hx", "hy"], 1, self.FREQUENCIES)
+        Y = _stft_fcs(["ex"], 2, Y_frequencies)
+        RR = _stft_fcs(["hx", "hy"], 3, RR_frequencies)
+
+        with pytest.raises(ValueError):
+            handle_nan(X, Y, RR, drop_dim="time")
+
+    def test_transposed_y_in_x_dimension_order(self):
+        """A 3D Y on frequency and time comes back in X's order, time and frequency."""
+        X = _stft_fcs(["hx", "hy"], 1, self.FREQUENCIES)
+        Y = _stft_fcs(["ex"], 2, self.FREQUENCIES, dims=("frequency", "time"))
+        RR = _stft_fcs(["hx", "hy"], 3, self.FREQUENCIES)
+
+        X_out, Y_out, RR_out = handle_nan(X, Y, RR, drop_dim="time")
+
+        assert Y_out["ex"].dims == ("time", "frequency")
+        np.testing.assert_array_equal(Y_out["ex"].values, Y["ex"].values.T)
+
+    def test_y_name_of_x_takes_x_values(self):
+        """A data variable of Y named as one of X's comes back with X's values."""
+        X = _stacked_fcs(["hx", "hy"], seed=1)
+        Y = _stacked_fcs(["hx"], seed=2)
+        RR = _stacked_fcs(["hx", "hy"], seed=3)
+
+        X_out, Y_out, RR_out = handle_nan(X, Y, RR, drop_dim="observation")
+
+        np.testing.assert_array_equal(Y_out["hx"].values, X["hx"].values)
+
+    def test_variable_attributes_dropped(self):
+        """A data variable with attributes, under the same dataset attributes,
+        comes back without them, as from the merge."""
+        X = _stacked_fcs(["hx", "hy"], seed=1)
+        Y = _stacked_fcs(["ex"], seed=2)
+        RR = _stacked_fcs(["hx", "hy"], seed=3)
+        X["hx"].attrs["units"] = "nT"
+
+        X_out, Y_out, RR_out = handle_nan(X, Y, RR, drop_dim="observation")
+
+        assert X_out["hx"].attrs == {}
+        np.testing.assert_array_equal(X_out["hx"].values, X["hx"].values)
+
+    def test_dataset_attributes_of_x(self):
+        """Y and RR with other dataset attributes than X, and no data variable
+        with attributes, come back with X's dataset attributes."""
+        X = _stacked_fcs(["hx", "hy"], seed=1).assign_attrs(station="x")
+        Y = _stacked_fcs(["ex"], seed=2).assign_attrs(station="y")
+        RR = _stacked_fcs(["hx", "hy"], seed=3)
+
+        X_out, Y_out, RR_out = handle_nan(X, Y, RR, drop_dim="observation")
+
+        assert Y_out.attrs == {"station": "x"}
+        assert RR_out.attrs == {"station": "x"}
+
+    def test_coordinates_of_x(self):
+        """Y and RR come back with X's coordinates, here without the attributes
+        of their time coordinates, which time_axis_match does not compare."""
+        X = _stacked_fcs(["hx", "hy"], seed=1)
+        Y = _stacked_fcs(["ex"], seed=2)
+        RR = _stacked_fcs(["hx", "hy"], seed=3)
+        Y["time"].attrs["units"] = "s"
+        RR["time"].attrs["units"] = "s"
+
+        X_out, Y_out, RR_out = handle_nan(X, Y, RR, drop_dim="observation")
+
+        assert Y_out["time"].attrs == {}
+        assert RR_out["time"].attrs == {}
+
+    def test_same_attributes_return_inputs(self):
+        """In the regression's layout, with the same dataset attributes on X, Y
+        and RR, the inputs are still returned as they are."""
+        X = _stacked_fcs(["hx", "hy"], seed=1).assign_attrs(station="x")
+        Y = _stacked_fcs(["ex"], seed=2).assign_attrs(station="x")
+        RR = _stacked_fcs(["hx", "hy"], seed=3).assign_attrs(station="x")
+
+        X_out, Y_out, RR_out = handle_nan(X, Y, RR, drop_dim="observation")
+
+        assert X_out is X
+        assert Y_out is Y
+        assert RR_out is RR
+
+    @pytest.mark.parametrize(
+        "channel",
+        [("observation", np.arange(60)), "a"],
+        ids=["on_observation", "scalar"],
+    )
+    def test_channel_coordinate_dropped(self, channel):
+        """A coordinate named "channel", the dimension of the merge's to_array,
+        is dropped from X, Y and RR, as by the merge."""
+        X = _stacked_fcs(["hx", "hy"], seed=1).assign_coords(channel=channel)
+        Y = _stacked_fcs(["ex"], seed=2).assign_coords(channel=channel)
+        RR = _stacked_fcs(["hx", "hy"], seed=3).assign_coords(channel=channel)
+
+        X_out, Y_out, RR_out = handle_nan(X, Y, RR, drop_dim="observation")
+
+        for ds in (X_out, Y_out, RR_out):
+            assert "channel" not in ds.coords
+
+    @pytest.mark.parametrize("drop_on_channel", [True, False])
+    def test_channel_dimension_raises(self, drop_on_channel):
+        """A dimension named "channel", the data's own or a coordinate's, clashes
+        with the merge's to_array and raises ValueError."""
+        datasets = [
+            _stacked_fcs(chs, seed)
+            for chs, seed in ((["hx", "hy"], 1), (["ex"], 2), (["hx", "hy"], 3))
+        ]
+        if drop_on_channel:
+            dim = "channel"
+            datasets = [ds.rename_dims(observation=dim) for ds in datasets]
+        else:
+            dim = "observation"
+            datasets = [ds.assign_coords(extra=("channel", [1, 2])) for ds in datasets]
+
+        with pytest.raises(ValueError):
+            handle_nan(*datasets, drop_dim=dim)
+
+    @pytest.mark.parametrize("all_integer", [True, False], ids=["all", "Y"])
+    def test_integer_channel_names_raise(self, all_integer):
+        """Integer channel names, of all datasets or of Y only, make the split
+        of the merge raise KeyError."""
+        X = _stacked_fcs([0, 1] if all_integer else ["hx", "hy"], seed=1)
+        Y = _stacked_fcs([2], seed=2)
+        RR = _stacked_fcs([0, 1] if all_integer else ["hx", "hy"], seed=3)
+
+        with pytest.raises(KeyError):
+            handle_nan(X, Y, RR, drop_dim="observation")
+
+    def test_coordinate_named_as_remote_channel_raises(self):
+        """A coordinate named as a renamed RR channel ("remote_hx") clashes with
+        it in the merge and raises ValueError."""
+        remote_hx = ("observation", np.arange(60))
+        X = _stacked_fcs(["hx", "hy"], seed=1).assign_coords(remote_hx=remote_hx)
+        Y = _stacked_fcs(["ex"], seed=2).assign_coords(remote_hx=remote_hx)
+        RR = _stacked_fcs(["hx", "hy"], seed=3).assign_coords(remote_hx=remote_hx)
+
+        with pytest.raises(ValueError):
+            handle_nan(X, Y, RR, drop_dim="observation")
