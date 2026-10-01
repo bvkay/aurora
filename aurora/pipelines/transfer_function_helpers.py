@@ -233,6 +233,70 @@ def stack_fcs(X, Y, RR):
     return X, Y, RR
 
 
+def stack_and_edf_weights(
+    X: xr.Dataset,
+    Y: xr.Dataset,
+    RR: Optional[xr.Dataset],
+    shared: Optional[dict] = None,
+) -> tuple:
+    """
+    Stacks the FCs of a band, drops the observations that are not finite and
+    computes the effective degrees of freedom weights of the rest.
+
+    The output channels of a band that have no channel weights are regressed
+    on the same X and RR. With `shared`, a dict kept for the band and passed
+    for each of those channels, X and RR are stacked and checked for values
+    that are not finite once per band, and when Y is finite too the weights
+    are computed once per band: each channel gets shallow copies of the
+    stacked X and RR, which apply_weights scales in place, and a copy of the
+    weights, in which apply_weights sets zero weights to NaN; the shared
+    weights stay as they are. When X, RR or Y holds a value that is not
+    finite, the observations are dropped and the weights computed for the
+    channel, as without `shared`.
+
+    Parameters
+    ----------
+    X: xarray.core.dataset.Dataset
+    Y: xarray.core.dataset.Dataset
+    RR: xarray.core.dataset.Dataset or None
+        The FCs of the band, on frequency and time.
+    shared: dict or None
+        An empty dict for the first output channel of a band, then the same
+        dict for the band's other output channels with the same X and RR.
+
+    Returns
+    -------
+    X, Y, RR: tuple
+        Stacked, without the observations that are not finite.
+    W: numpy array
+        The effective degrees of freedom weights of the observations.
+    """
+    if shared is None:
+        X, Y, RR = stack_fcs(X, Y, RR)
+        # Should only be needed if weights were applied
+        X, Y, RR = drop_nans(X, Y, RR)
+        W = effective_degrees_of_freedom_weights(X, RR, edf_obj=None)
+        return X, Y, RR, W
+
+    if "X" not in shared:
+        shared["X"] = stack_frequency_time(X)
+        shared["RR"] = None if RR is None else stack_frequency_time(RR)
+        shared["finite"] = all_finite(shared["X"], shared["RR"])
+    X, RR = shared["X"], shared["RR"]
+    Y = stack_frequency_time(Y)
+    if not (shared["finite"] and all_finite(Y)):
+        X, Y, RR = drop_nans(X, Y, RR)
+        W = effective_degrees_of_freedom_weights(X, RR, edf_obj=None)
+        return X, Y, RR, W
+
+    if "W" not in shared:
+        shared["W"] = effective_degrees_of_freedom_weights(X, RR, edf_obj=None)
+    X = X.copy(deep=False)
+    if RR is not None:
+        RR = RR.copy(deep=False)
+    return X, Y, RR, shared["W"].copy()
+
+
 def apply_weights(
     X: xr.Dataset,
     Y: xr.Dataset,
@@ -545,6 +609,9 @@ def process_transfer_functions_with_weights(
         keep = window_mask_for_band(dec_level_config, band, X_band.time.values)
         X_band, Y_band, RR_band = apply_window_mask(X_band, Y_band, RR_band, keep)
 
+        # the stacked X and RR and their EDF weights, shared by the output
+        # channels without channel weights
+        shared = {}
         for ch in dec_level_config.output_channels:
             weights, channel_spec = channel_weights[ch]
             X, RR = X_band, RR_band
@@ -570,12 +637,10 @@ def process_transfer_functions_with_weights(
                     X, Y_ch, RR, band_weights.squeeze(), segment=True, dropna=False
                 )
 
-            X, Y_ch, RR = stack_fcs(X, Y_ch, RR)  # Reshape to 2d
-
-            # Should only be needed if weights were applied
-            X, Y_ch, RR = drop_nans(X, Y_ch, RR)
-
-            W = effective_degrees_of_freedom_weights(X, RR, edf_obj=None)
+            # Reshape to 2d, drop NaN and compute the EDF weights
+            X, Y_ch, RR, W = stack_and_edf_weights(
+                X, Y_ch, RR, shared=shared if weights is None else None
+            )
 
             X, Y_ch, RR = apply_weights(X, Y_ch, RR, W, segment=False, dropna=True)
             X_, Y_, RR_ = handle_nan(X, Y_ch, RR, drop_dim="observation")
